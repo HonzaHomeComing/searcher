@@ -16,8 +16,10 @@ import webbrowser
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
+from html import unescape
+from collections import defaultdict
 
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -63,18 +65,42 @@ class Video:
 def parse_duration_seconds(duration: str | None) -> int | None:
     if not duration:
         return None
-    parts = duration.strip().split(":")
-    try:
-        nums = [int(p) for p in parts]
-    except ValueError:
-        return None
-    if len(nums) == 1:
-        return nums[0]
-    if len(nums) == 2:
-        return nums[0] * 60 + nums[1]
-    if len(nums) == 3:
-        return nums[0] * 3600 + nums[1] * 60 + nums[2]
+    text = duration.strip().lower()
+    # "1:23" / "1:02:03"
+    if re.fullmatch(r"\d{1,2}(?::\d{2}){1,2}", text):
+        parts = [int(p) for p in text.split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    # "50 seconds", "3 minutes", "1 minute 12 seconds"
+    seconds = 0
+    found = False
+    hours = re.search(r"(\d+)\s*hours?", text)
+    mins = re.search(r"(\d+)\s*min", text)
+    secs = re.search(r"(\d+)\s*sec", text)
+    if hours:
+        seconds += int(hours.group(1)) * 3600
+        found = True
+    if mins:
+        seconds += int(mins.group(1)) * 60
+        found = True
+    if secs:
+        seconds += int(secs.group(1))
+        found = True
+    if found:
+        return seconds
     return None
+
+
+def format_duration(seconds: int | None) -> str:
+    if seconds is None or seconds <= 0:
+        return ""
+    if seconds < 3600:
+        return f"{seconds // 60}:{seconds % 60:02d}"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h}:{m:02d}:{s:02d}"
 
 
 def is_under_five_minutes(duration: str | None, title: str = "") -> bool:
@@ -183,6 +209,101 @@ def save_settings(settings: dict) -> None:
         pass
 
 
+def parse_bing_aria(label: str) -> tuple[str, str, str]:
+    """Parse Bing video aria-label into title, duration, channel."""
+    parts = [p.strip() for p in label.split("·")]
+    title = parts[0] if parts else label
+    # Strip trailing "from YouTube" style suffixes in the title segment
+    title = re.sub(r"\s+from\s+\w[\w\s]*$", "", title, flags=re.I).strip()
+    duration = ""
+    channel = ""
+    for part in parts[1:]:
+        low = part.lower()
+        if low.startswith("duration"):
+            duration = part.split(":", 1)[-1].strip()
+        elif low.startswith("uploaded by"):
+            channel = part.split("by", 1)[-1].strip()
+    seconds = parse_duration_seconds(duration)
+    return title, format_duration(seconds) if seconds else duration, channel
+
+
+def search_bing_videos(query: str) -> list[Video]:
+    """
+    Open-web short video search via Bing Videos (any publisher/domain).
+    Uses the short-duration filter, then keeps clips under 5 minutes.
+    """
+    if requests is None:
+        return []
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    # Several query shapes help surface non-YouTube publishers on the open web.
+    query_variants = [
+        query,
+        f"{query} clip",
+        f"{query} short video",
+        f"{query} reel OR shorts OR tiktok OR instagram",
+    ]
+    out: list[Video] = []
+    seen: set[str] = set()
+
+    for variant in query_variants:
+        url = (
+            "https://www.bing.com/videos/search?"
+            f"q={quote_plus(variant)}&qft=+filterui:duration-short"
+        )
+        try:
+            html = requests.get(url, headers=headers, timeout=20).text
+        except Exception:
+            continue
+
+        metas = re.findall(r'mmeta="(\{&quot;.*?&quot;\})"', html)
+        arias = re.findall(r'aria-label="([^"]+)"[^>]*class="mc_vtvc_link"', html)
+
+        for index, raw in enumerate(metas):
+            try:
+                meta = json.loads(unescape(raw))
+            except Exception:
+                continue
+            video_url = meta.get("murl") or meta.get("pgurl") or ""
+            if not video_url:
+                continue
+            key = video_url.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            title = ""
+            duration = ""
+            channel = ""
+            if index < len(arias):
+                title, duration, channel = parse_bing_aria(arias[index])
+            if not is_under_five_minutes(duration, title):
+                continue
+
+            site = site_from_url(video_url)
+            thumb = meta.get("turl") or youtube_thumb(video_url)
+            # Bing thumbs sometimes need unescaping
+            thumb = unescape(thumb or "")
+            out.append(
+                Video(
+                    title=title or "Untitled video",
+                    url=video_url,
+                    site=site,
+                    channel=channel or site,
+                    duration=duration,
+                    thumbnail=thumb,
+                )
+            )
+
+    return out
+
+
 def search_ddg_videos(query: str) -> list[Video]:
     if DDGS is None:
         return []
@@ -209,6 +330,62 @@ def search_ddg_videos(query: str) -> list[Video]:
                 channel=item.get("uploader") or item.get("publisher") or site,
                 duration=duration,
                 thumbnail=item.get("image") or youtube_thumb(url),
+            )
+        )
+    return out
+
+
+def search_web_pages_for_videos(query: str) -> list[Video]:
+    """Fallback: web search hits that look like video pages on any domain."""
+    if DDGS is None:
+        return []
+    patterns = (
+        r"/video/",
+        r"/videos/",
+        r"/watch",
+        r"/shorts/",
+        r"/reel/",
+        r"/reels/",
+        r"/clip/",
+        r"/clips/",
+        r"vimeo\.com/\d+",
+        r"youtu\.be/",
+        r"tiktok\.com/.*/video/",
+        r"dailymotion\.com/video/",
+        r"streamable\.com/",
+        r"rumble\.com/",
+        r"bitchute\.com/",
+        r"odysee\.com/",
+        r"facebook\.com/reel/",
+        r"instagram\.com/reel/",
+        r"\.(mp4|webm)(?:$|\?)",
+    )
+    combined = re.compile("|".join(patterns), re.I)
+    out: list[Video] = []
+    try:
+        with DDGS() as ddgs:
+            items = list(
+                ddgs.text(
+                    f"{query} (video OR clip OR reel OR shorts OR tiktok OR vimeo)",
+                    max_results=40,
+                )
+            )
+    except Exception:
+        return []
+
+    for item in items:
+        url = item.get("href") or item.get("link") or ""
+        if not url or not combined.search(url):
+            continue
+        site = site_from_url(url)
+        out.append(
+            Video(
+                title=item.get("title") or "Untitled video",
+                url=url,
+                site=site,
+                channel=site,
+                duration="",
+                thumbnail=youtube_thumb(url),
             )
         )
     return out
@@ -244,7 +421,6 @@ def search_youtube_innertube(query: str) -> list[Video]:
             },
             "query": f"{query} #shorts",
         }
-        # Prefer a second pass without duration filter if needed — client filters to ≤5 min.
         resp = session.post(
             f"https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key={api_key}",
             json=payload,
@@ -340,12 +516,34 @@ def dedupe(videos: list[Video]) -> list[Video]:
     return out
 
 
+def diversify_by_site(videos: list[Video], limit: int) -> list[Video]:
+    """Round-robin across domains so one site cannot fill the whole grid."""
+    buckets: dict[str, list[Video]] = defaultdict(list)
+    for video in videos:
+        buckets[video.site or "unknown"].append(video)
+
+    # Prefer sites with fewer items first when picking order of buckets? 
+    # Actually rotate through all sites fairly.
+    site_order = sorted(buckets.keys(), key=lambda s: (s == "youtube.com", s))
+    out: list[Video] = []
+    while len(out) < limit and any(buckets.values()):
+        for site in site_order:
+            if not buckets[site]:
+                continue
+            out.append(buckets[site].pop(0))
+            if len(out) >= limit:
+                break
+    return out
+
+
 def search_videos(query: str, blacklist: list[str]) -> tuple[list[Video], list[str]]:
     errors: list[str] = []
     collected: list[Video] = []
 
     for label, fn in (
-        ("Web videos", lambda: search_ddg_videos(query)),
+        ("Open web (Bing)", lambda: search_bing_videos(query)),
+        ("Open web (DuckDuckGo videos)", lambda: search_ddg_videos(query)),
+        ("Open web pages", lambda: search_web_pages_for_videos(query)),
         ("YouTube", lambda: search_youtube_innertube(query)),
     ):
         try:
@@ -359,8 +557,10 @@ def search_videos(query: str, blacklist: list[str]) -> tuple[list[Video], list[s
         if not is_blacklisted(v.site, blacklist)
         and is_under_five_minutes(v.duration, v.title)
     ]
+    # Prefer items that have a known duration, then mix sites.
     filtered.sort(key=lambda v: (bool(v.duration), bool(v.thumbnail)), reverse=True)
-    return filtered[:MAX_RESULTS], errors
+    mixed = diversify_by_site(filtered, MAX_RESULTS)
+    return mixed, errors
 
 
 class ShortSeekApp(tk.Tk):
@@ -424,7 +624,7 @@ class ShortSeekApp(tk.Tk):
         ttk.Label(header, text=APP_NAME, style="Title.TLabel").pack(side="left")
         ttk.Label(
             header,
-            text="  Any site · videos under 5 minutes",
+            text="  Whole web · videos under 5 minutes",
             style="Muted.TLabel",
         ).pack(side="left", padx=(8, 0))
         self.blacklist_btn = ttk.Button(
@@ -481,7 +681,7 @@ class ShortSeekApp(tk.Tk):
         self._reload_blacklist_listbox()
 
         self.status_var = tk.StringVar(
-            value="Search any keyword. Blacklist any website domain you want to hide."
+            value="Search the whole web for videos under 5 minutes. Blacklist any domain you want to hide."
         )
         self.status_label = ttk.Label(
             root, textvariable=self.status_var, style="Muted.TLabel"
