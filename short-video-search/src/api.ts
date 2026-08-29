@@ -3,9 +3,6 @@ import {
   DEFAULT_BLACKLIST,
   type BlacklistState,
   type PlatformId,
-  type VideoResult,
-  detectPlatform,
-  isShortDuration,
 } from './shared/types'
 
 const STORAGE_KEY = 'short-seek-blacklist'
@@ -24,13 +21,13 @@ function writeBrowserBlacklist(blacklist: BlacklistState) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(blacklist))
 }
 
-async function browserSearch(query: string): Promise<{ videos: VideoResult[]; errors: string[] }> {
+async function browserSearch(query: string) {
   const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`)
   if (!response.ok) {
     const text = await response.text()
     throw new Error(text || `Search failed (${response.status})`)
   }
-  const data = (await response.json()) as { videos: VideoResult[]; errors: string[] }
+  const data = (await response.json()) as Awaited<ReturnType<ShortSeekApi['searchVideos']>>
   const blacklist = readBrowserBlacklist()
   return {
     videos: (data.videos || []).filter((video) => !blacklist[video.platform]),
@@ -60,29 +57,4 @@ export const browserApi: ShortSeekApi = {
 
 export function getApi(): ShortSeekApi {
   return window.shortSeek ?? browserApi
-}
-
-export function normalizeVideo(raw: {
-  id?: string
-  title?: string
-  url: string
-  thumbnail?: string
-  duration?: string
-  platform?: PlatformId
-  channel?: string
-  source?: 'duckduckgo' | 'youtube'
-  publishedOn?: string
-}): VideoResult | null {
-  if (!raw.url) return null
-  if (raw.duration && !isShortDuration(raw.duration)) return null
-  return {
-    id: raw.id || raw.url,
-    title: raw.title || 'Untitled video',
-    url: raw.url,
-    thumbnail: raw.thumbnail || '',
-    duration: raw.duration || '',
-    platform: raw.platform || detectPlatform(raw.url, raw.publishedOn),
-    channel: raw.channel || 'Unknown',
-    source: raw.source || 'duckduckgo',
-  }
 }
