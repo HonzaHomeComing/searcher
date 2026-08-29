@@ -1,17 +1,12 @@
 # Short Seek
 
-One-file windowed short-video search app with site blacklist toggles.
-
-## Run
+One-file windowed app: search the web for videos under 5 minutes, blacklist any website.
 
 ```bash
 pip install duckduckgo-search pillow requests
 python3 short_seek.py
 ```
 
-## Features
-
-- Keyword search for short-form videos
-- Vertical result grid (Google Shorts-style)
-- **Sources** panel: toggle a site on to blacklist it
-- Opens clips in your browser on click
+- Search any keyword (results from any site)
+- Only shows videos **under 5 minutes**
+- **Blacklist** any domain (type it in, or click **Blacklist site** on a result)
