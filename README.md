@@ -1,13 +1,17 @@
-# searcher
+# Short Seek
 
-## Short Seek
+One-file windowed short-video search app with site blacklist toggles.
 
-Desktop short-video search app (Electron) lives in [`short-video-search/`](./short-video-search).
+## Run
 
 ```bash
-cd short-video-search
-npm install
-npm run dev
+pip install duckduckgo-search pillow requests
+python3 short_seek.py
 ```
 
-Search by keyword for short-form clips, then use **Sources** to blacklist sites with toggles.
+## Features
+
+- Keyword search for short-form videos
+- Vertical result grid (Google Shorts-style)
+- **Sources** panel: toggle a site on to blacklist it
+- Opens clips in your browser on click
